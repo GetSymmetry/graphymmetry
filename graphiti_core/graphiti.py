@@ -24,6 +24,7 @@ from typing_extensions import LiteralString
 
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.rate_limiting import RateLimitConfig, RateLimiter
 from graphiti_core.decorators import handle_multiple_group_ids
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
@@ -143,6 +144,7 @@ class Graphiti:
         max_coroutines: int | None = None,
         tracer: Tracer | None = None,
         trace_span_prefix: str = 'graphiti',
+        rate_limit_config: RateLimitConfig | None = None,
     ):
         """
         Initialize a Graphiti instance.
@@ -179,6 +181,10 @@ class Graphiti:
             An OpenTelemetry tracer instance for distributed tracing. If not provided, tracing is disabled (no-op).
         trace_span_prefix : str, optional
             Prefix to prepend to all span names. Defaults to 'graphiti'.
+        rate_limit_config : RateLimitConfig | None, optional
+            Configuration for rate limiting LLM and embedding API calls. If provided, a shared
+            rate limiter will be created and configured on all clients. This is useful for
+            parallel processing to avoid exceeding API rate limits.
 
         Returns
         -------
@@ -226,6 +232,13 @@ class Graphiti:
 
         # Set tracer on clients
         self.llm_client.set_tracer(self.tracer)
+
+        # Initialize rate limiting if configured
+        self.rate_limiter: RateLimiter | None = None
+        if rate_limit_config is not None:
+            self.rate_limiter = RateLimiter(rate_limit_config)
+            self.llm_client.set_rate_limiter(self.rate_limiter)
+            self.embedder.set_rate_limiter(self.rate_limiter)
 
         self.clients = GraphitiClients(
             driver=self.driver,

@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from ..prompts.models import Message
+from ..rate_limiting import RateLimiter, ResourceType
 from ..tracer import NoOpTracer, Tracer
 from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
 from .errors import RateLimitError
@@ -80,6 +81,7 @@ class LLMClient(ABC):
         self.cache_enabled = cache
         self.cache_dir = None
         self.tracer: Tracer = NoOpTracer()
+        self.rate_limiter: RateLimiter | None = None
 
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
@@ -88,6 +90,20 @@ class LLMClient(ABC):
     def set_tracer(self, tracer: Tracer) -> None:
         """Set the tracer for this LLM client."""
         self.tracer = tracer
+
+    def set_rate_limiter(self, rate_limiter: RateLimiter | None) -> None:
+        """Set the rate limiter for this LLM client.
+
+        Args:
+            rate_limiter: The rate limiter to use, or None to disable rate limiting.
+        """
+        self.rate_limiter = rate_limiter
+
+    def _get_resource_type(self, model_size: ModelSize) -> ResourceType:
+        """Map model size to rate limiter resource type."""
+        if model_size == ModelSize.small:
+            return ResourceType.LLM_SMALL
+        return ResourceType.LLM_MEDIUM
 
     def _clean_input(self, input: str) -> str:
         """Clean input string of invalid unicode and control characters.
@@ -199,11 +215,20 @@ class LLMClient(ABC):
 
             span.add_attributes({'cache.hit': False})
 
-            # Execute LLM call
+            # Execute LLM call with optional rate limiting
             try:
-                response = await self._generate_response_with_retry(
-                    messages, response_model, max_tokens, model_size
-                )
+                if self.rate_limiter is not None:
+                    resource_type = self._get_resource_type(model_size)
+                    async with self.rate_limiter.limit(resource_type) as wait_time:
+                        if wait_time > 0:
+                            span.add_attributes({'rate_limit.wait_ms': wait_time})
+                        response = await self._generate_response_with_retry(
+                            messages, response_model, max_tokens, model_size
+                        )
+                else:
+                    response = await self._generate_response_with_retry(
+                        messages, response_model, max_tokens, model_size
+                    )
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)

@@ -66,6 +66,7 @@ class GeminiEmbedder(EmbedderClient):
             client (genai.Client | None): An optional async client instance to use. If not provided, a new genai.Client is created.
             batch_size (int | None): An optional batch size to use. If not provided, the default batch size will be used.
         """
+        super().__init__()
         if config is None:
             config = GeminiEmbedderConfig()
 

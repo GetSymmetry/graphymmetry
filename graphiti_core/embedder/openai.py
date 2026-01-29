@@ -42,6 +42,7 @@ class OpenAIEmbedder(EmbedderClient):
         config: OpenAIEmbedderConfig | None = None,
         client: AsyncOpenAI | AsyncAzureOpenAI | None = None,
     ):
+        super().__init__()
         if config is None:
             config = OpenAIEmbedderConfig()
         self.config = config

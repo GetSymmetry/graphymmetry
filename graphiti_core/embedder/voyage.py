@@ -46,6 +46,7 @@ class VoyageAIEmbedder(EmbedderClient):
     """
 
     def __init__(self, config: VoyageAIEmbedderConfig | None = None):
+        super().__init__()
         if config is None:
             config = VoyageAIEmbedderConfig()
         self.config = config
