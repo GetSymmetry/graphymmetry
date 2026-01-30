@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from time import time
+from typing import Callable
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -24,6 +28,7 @@ from typing_extensions import LiteralString
 
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.metrics import BatchMetrics, EpisodeMetrics, MetricsCollector
 from graphiti_core.rate_limiting import RateLimitConfig, RateLimiter
 from graphiti_core.decorators import handle_multiple_group_ids
 from graphiti_core.driver.driver import GraphDriver
@@ -114,6 +119,7 @@ class AddEpisodeResults(BaseModel):
     edges: list[EntityEdge]
     communities: list[CommunityNode]
     community_edges: list[CommunityEdge]
+    metrics: 'EpisodeMetrics | None' = None
 
 
 class AddBulkEpisodeResults(BaseModel):
@@ -128,6 +134,67 @@ class AddBulkEpisodeResults(BaseModel):
 class AddTripletResults(BaseModel):
     nodes: list[EntityNode]
     edges: list[EntityEdge]
+
+
+class ErrorAction(Enum):
+    """Action to take when an error occurs during batch processing."""
+
+    ABORT_BATCH = 'abort'
+    SKIP_EPISODE = 'skip'
+
+
+@dataclass
+class EpisodeInput:
+    """Input for a single episode in batch processing.
+
+    Attributes:
+        name: Name/identifier for the episode.
+        episode_body: The content of the episode.
+        source_description: Description of the episode's source.
+        reference_time: The reference time for the episode.
+        source: The type of the episode. Defaults to EpisodeType.message.
+        group_id: Optional group ID for graph partitioning.
+        uuid: Optional UUID for the episode.
+        update_communities: Whether to update communities. Defaults to False.
+        entity_types: Optional dict mapping entity type names to Pydantic models.
+        excluded_entity_types: Optional list of entity types to exclude.
+        edge_types: Optional dict mapping edge type names to Pydantic models.
+        edge_type_map: Optional mapping of (source_type, target_type) to allowed edge types.
+        custom_extraction_instructions: Optional custom extraction instructions.
+        saga: Optional saga name or SagaNode to associate this episode with.
+        saga_previous_episode_uuid: Optional UUID of previous episode in saga.
+    """
+
+    name: str
+    episode_body: str
+    source_description: str
+    reference_time: datetime
+    source: EpisodeType = field(default_factory=lambda: EpisodeType.message)
+    group_id: str | None = None
+    uuid: str | None = None
+    update_communities: bool = False
+    entity_types: dict[str, type[BaseModel]] | None = None
+    excluded_entity_types: list[str] | None = None
+    edge_types: dict[str, type[BaseModel]] | None = None
+    edge_type_map: dict[tuple[str, str], list[str]] | None = None
+    custom_extraction_instructions: str | None = None
+    saga: 'str | SagaNode | None' = None
+    saga_previous_episode_uuid: str | None = None
+
+
+@dataclass
+class BatchResults:
+    """Results from batch episode processing.
+
+    Attributes:
+        successful: List of successful episode results.
+        failed: List of (EpisodeInput, Exception) tuples for failed episodes.
+        metrics: Aggregated metrics across all episodes in the batch.
+    """
+
+    successful: list[AddEpisodeResults] = field(default_factory=list)
+    failed: list[tuple[EpisodeInput, Exception]] = field(default_factory=list)
+    metrics: 'BatchMetrics' = field(default_factory=lambda: BatchMetrics())
 
 
 class Graphiti:
@@ -859,6 +926,12 @@ class Graphiti:
         start = time()
         now = utc_now()
 
+        # Set up metrics collection
+        metrics_collector = MetricsCollector()
+        metrics_collector.start()
+        self.llm_client.set_metrics_collector(metrics_collector)
+        self.embedder.set_metrics_collector(metrics_collector)
+
         validate_entity_types(entity_types)
         validate_excluded_entity_types(excluded_entity_types, entity_types)
 
@@ -999,6 +1072,17 @@ class Graphiti:
 
                 logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
 
+                # Finalize metrics
+                metrics_collector.episode_id = episode.uuid
+                episode_metrics = metrics_collector.finalize(
+                    entities_count=len(hydrated_nodes),
+                    edges_count=len(entity_edges),
+                )
+
+                # Clean up metrics collectors
+                self.llm_client.set_metrics_collector(None)
+                self.embedder.set_metrics_collector(None)
+
                 return AddEpisodeResults(
                     episode=episode,
                     episodic_edges=episodic_edges,
@@ -1006,9 +1090,13 @@ class Graphiti:
                     edges=entity_edges,
                     communities=communities,
                     community_edges=community_edges,
+                    metrics=episode_metrics,
                 )
 
             except Exception as e:
+                # Clean up metrics collectors on error
+                self.llm_client.set_metrics_collector(None)
+                self.embedder.set_metrics_collector(None)
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise e
@@ -1269,6 +1357,158 @@ class Graphiti:
                 bulk_span.set_status('error', str(e))
                 bulk_span.record_exception(e)
                 raise e
+
+    async def add_episodes_batch(
+        self,
+        episodes: list[EpisodeInput],
+        parallelism: int = 5,
+        on_episode_complete: Callable[[str, EpisodeMetrics], None] | None = None,
+        on_error: Callable[[str, Exception], ErrorAction] | None = None,
+    ) -> BatchResults:
+        """
+        Process multiple episodes in parallel with shared rate limiting.
+
+        This method processes episodes concurrently using a semaphore to limit parallelism.
+        Each episode is processed independently via add_episode(), sharing the same rate
+        limiter configured on the Graphiti instance. This is ideal for processing multiple
+        conversations where each conversation should be processed atomically.
+
+        Unlike add_episode_bulk(), which processes episodes as a single batch with shared
+        deduplication, this method processes each episode independently, making it suitable
+        for scenarios where episodes represent separate conversations that should maintain
+        their own context.
+
+        Parameters
+        ----------
+        episodes : list[EpisodeInput]
+            List of episodes to process.
+        parallelism : int, optional
+            Maximum number of concurrent episodes to process. Defaults to 5.
+            This controls conversation-level concurrency. API-level rate limiting
+            is controlled separately via RateLimitConfig.
+        on_episode_complete : Callable[[str, EpisodeMetrics], None] | None, optional
+            Callback invoked after each episode completes successfully.
+            Receives the episode name and its metrics.
+        on_error : Callable[[str, Exception], ErrorAction] | None, optional
+            Callback invoked when an episode fails. Receives the episode name and exception.
+            Should return ErrorAction.ABORT_BATCH to stop processing remaining episodes,
+            or ErrorAction.SKIP_EPISODE to continue with the next episode.
+            If not provided, defaults to SKIP_EPISODE behavior.
+
+        Returns
+        -------
+        BatchResults
+            Contains successful results, failed episodes, and aggregated metrics.
+
+        Notes
+        -----
+        - Rate limiting (if configured) is shared across all parallel workers
+        - Each episode maintains its own context and is processed via add_episode()
+        - Progress callbacks are invoked from the worker coroutines
+        - If on_error returns ABORT_BATCH, remaining pending episodes are cancelled
+
+        Example:
+            async def on_complete(name, metrics):
+                print(f"Completed {name}: {metrics.total_llm_calls} LLM calls")
+
+            async def on_error(name, error):
+                print(f"Failed {name}: {error}")
+                return ErrorAction.SKIP_EPISODE
+
+            results = await graphiti.add_episodes_batch(
+                episodes=episode_list,
+                parallelism=5,
+                on_episode_complete=on_complete,
+                on_error=on_error,
+            )
+        """
+        start = time()
+        semaphore = asyncio.Semaphore(parallelism)
+        batch_metrics = BatchMetrics(total_episodes=len(episodes))
+        results = BatchResults(metrics=batch_metrics)
+        abort_event = asyncio.Event()
+
+        async def process_episode(episode_input: EpisodeInput) -> AddEpisodeResults | None:
+            """Process a single episode with semaphore-controlled concurrency."""
+            if abort_event.is_set():
+                return None
+
+            async with semaphore:
+                if abort_event.is_set():
+                    return None
+
+                try:
+                    result = await self.add_episode(
+                        name=episode_input.name,
+                        episode_body=episode_input.episode_body,
+                        source_description=episode_input.source_description,
+                        reference_time=episode_input.reference_time,
+                        source=episode_input.source,
+                        group_id=episode_input.group_id,
+                        uuid=episode_input.uuid,
+                        update_communities=episode_input.update_communities,
+                        entity_types=episode_input.entity_types,
+                        excluded_entity_types=episode_input.excluded_entity_types,
+                        edge_types=episode_input.edge_types,
+                        edge_type_map=episode_input.edge_type_map,
+                        custom_extraction_instructions=episode_input.custom_extraction_instructions,
+                        saga=episode_input.saga,
+                        saga_previous_episode_uuid=episode_input.saga_previous_episode_uuid,
+                    )
+
+                    # Record success metrics
+                    if result.metrics:
+                        batch_metrics.add_episode_metrics(result.metrics, success=True)
+
+                    # Invoke completion callback
+                    if on_episode_complete and result.metrics:
+                        on_episode_complete(episode_input.name, result.metrics)
+
+                    return result
+
+                except Exception as e:
+                    logger.error(f'Failed to process episode {episode_input.name}: {e}')
+
+                    # Create error metrics
+                    error_metrics = EpisodeMetrics(
+                        episode_id=episode_input.uuid or '',
+                        errors=[str(e)],
+                    )
+                    batch_metrics.add_episode_metrics(error_metrics, success=False)
+
+                    # Record failure
+                    results.failed.append((episode_input, e))
+
+                    # Invoke error callback to determine action
+                    if on_error:
+                        action = on_error(episode_input.name, e)
+                        if action == ErrorAction.ABORT_BATCH:
+                            abort_event.set()
+                            return None
+
+                    return None
+
+        # Process all episodes concurrently with semaphore limiting
+        tasks = [asyncio.create_task(process_episode(ep)) for ep in episodes]
+
+        # Wait for all tasks to complete
+        completed_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Collect successful results (filter out None and exceptions)
+        for result in completed_results:
+            if isinstance(result, AddEpisodeResults):
+                results.successful.append(result)
+
+        # Calculate total wall clock time
+        end = time()
+        batch_metrics.total_wall_clock_ms = (end - start) * 1000
+
+        logger.info(
+            f'Completed add_episodes_batch: {batch_metrics.completed_episodes}/{batch_metrics.total_episodes} '
+            f'episodes in {batch_metrics.total_wall_clock_ms:.0f}ms'
+        )
+
+        return results
 
     @handle_multiple_group_ids
     async def build_communities(

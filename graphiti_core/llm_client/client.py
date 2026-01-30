@@ -25,6 +25,7 @@ from diskcache import Cache
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
+from ..metrics import MetricsCollector
 from ..prompts.models import Message
 from ..rate_limiting import RateLimiter, ResourceType
 from ..tracer import NoOpTracer, Tracer
@@ -68,6 +69,32 @@ def is_server_or_retry_error(exception):
     )
 
 
+def _on_retry(retry_state) -> None:
+    """Callback executed after each retry attempt.
+
+    Logs the retry and records it in the metrics collector if one is set.
+    """
+    if retry_state.attempt_number > 1:
+        logger.warning(
+            f'Retrying {retry_state.fn.__name__ if retry_state.fn else "function"} '
+            f'after {retry_state.attempt_number} attempts...'
+        )
+        # Record retry in metrics collector if available
+        # retry_state.args[0] is 'self' for instance methods
+        if retry_state.args:
+            client = retry_state.args[0]
+            if hasattr(client, 'metrics_collector') and client.metrics_collector is not None:
+                import asyncio
+
+                # Schedule the coroutine to run
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(client.metrics_collector.record_retry())
+                except RuntimeError:
+                    # No running event loop, skip metrics recording
+                    pass
+
+
 class LLMClient(ABC):
     def __init__(self, config: LLMConfig | None, cache: bool = False):
         if config is None:
@@ -82,6 +109,7 @@ class LLMClient(ABC):
         self.cache_dir = None
         self.tracer: Tracer = NoOpTracer()
         self.rate_limiter: RateLimiter | None = None
+        self.metrics_collector: MetricsCollector | None = None
 
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
@@ -98,6 +126,14 @@ class LLMClient(ABC):
             rate_limiter: The rate limiter to use, or None to disable rate limiting.
         """
         self.rate_limiter = rate_limiter
+
+    def set_metrics_collector(self, collector: MetricsCollector | None) -> None:
+        """Set the metrics collector for this LLM client.
+
+        Args:
+            collector: The metrics collector to use, or None to disable metrics collection.
+        """
+        self.metrics_collector = collector
 
     def _get_resource_type(self, model_size: ModelSize) -> ResourceType:
         """Map model size to rate limiter resource type."""
@@ -131,11 +167,7 @@ class LLMClient(ABC):
         stop=stop_after_attempt(4),
         wait=wait_random_exponential(multiplier=10, min=5, max=120),
         retry=retry_if_exception(is_server_or_retry_error),
-        after=lambda retry_state: logger.warning(
-            f'Retrying {retry_state.fn.__name__ if retry_state.fn else "function"} after {retry_state.attempt_number} attempts...'
-        )
-        if retry_state.attempt_number > 1
-        else None,
+        after=_on_retry,
         reraise=True,
     )
     async def _generate_response_with_retry(
@@ -229,6 +261,10 @@ class LLMClient(ABC):
                     response = await self._generate_response_with_retry(
                         messages, response_model, max_tokens, model_size
                     )
+
+                # Record metrics if collector is set
+                if self.metrics_collector is not None:
+                    await self.metrics_collector.record_llm_call(model_size)
             except Exception as e:
                 span.set_status('error', str(e))
                 span.record_exception(e)

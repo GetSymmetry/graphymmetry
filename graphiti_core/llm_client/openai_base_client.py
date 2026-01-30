@@ -216,6 +216,9 @@ class BaseOpenAIClient(LLMClient):
                     response = await self._generate_response(
                         messages, response_model, max_tokens, model_size
                     )
+                    # Record metrics if collector is set
+                    if self.metrics_collector is not None:
+                        await self.metrics_collector.record_llm_call(model_size)
                     return response
                 except (RateLimitError, RefusalError):
                     # These errors should not trigger retries
@@ -240,6 +243,10 @@ class BaseOpenAIClient(LLMClient):
                         raise
 
                     retry_count += 1
+
+                    # Record retry in metrics if collector is set
+                    if self.metrics_collector is not None:
+                        await self.metrics_collector.record_retry()
 
                     # Construct a detailed error message for the LLM
                     error_context = (
