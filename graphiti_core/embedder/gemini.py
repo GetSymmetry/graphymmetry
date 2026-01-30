@@ -86,7 +86,7 @@ class GeminiEmbedder(EmbedderClient):
         else:
             self.batch_size = batch_size
 
-    async def create(
+    async def _create_impl(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
         """
@@ -107,11 +107,11 @@ class GeminiEmbedder(EmbedderClient):
         )
 
         if not result.embeddings or len(result.embeddings) == 0 or not result.embeddings[0].values:
-            raise ValueError('No embeddings returned from Gemini API in create()')
+            raise ValueError('No embeddings returned from Gemini API in _create_impl()')
 
         return result.embeddings[0].values
 
-    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+    async def _create_batch_impl(self, input_data_list: list[str]) -> list[list[float]]:
         """
         Create embeddings for a batch of input data using Google's Gemini embedding model.
 

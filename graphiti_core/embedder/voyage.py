@@ -52,7 +52,7 @@ class VoyageAIEmbedder(EmbedderClient):
         self.config = config
         self.client = voyageai.AsyncClient(api_key=config.api_key)  # type: ignore[reportUnknownMemberType]
 
-    async def create(
+    async def _create_impl(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
         if isinstance(input_data, str):
@@ -69,7 +69,7 @@ class VoyageAIEmbedder(EmbedderClient):
         result = await self.client.embed(input_list, model=self.config.embedding_model)
         return [float(x) for x in result.embeddings[0][: self.config.embedding_dim]]
 
-    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+    async def _create_batch_impl(self, input_data_list: list[str]) -> list[list[float]]:
         result = await self.client.embed(input_data_list, model=self.config.embedding_model)
         return [
             [float(x) for x in embedding[: self.config.embedding_dim]]

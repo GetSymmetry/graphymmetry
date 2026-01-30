@@ -54,21 +54,20 @@ class EmbedderClient(ABC):
         self.metrics_collector = collector
 
     @abstractmethod
+    async def _create_impl(
+        self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
+    ) -> list[float]:
+        """Implementation method for creating embeddings. Subclasses must override this."""
+        pass
+
+    async def _create_batch_impl(self, input_data_list: list[str]) -> list[list[float]]:
+        """Implementation method for creating batch embeddings. Subclasses should override this."""
+        raise NotImplementedError()
+
     async def create(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
-        pass
-
-    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
-        raise NotImplementedError()
-
-    async def create_with_rate_limit(
-        self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
-    ) -> list[float]:
         """Create embeddings with rate limiting and metrics applied.
-
-        This method wraps the create method with rate limiting if a rate limiter is configured,
-        and records metrics if a metrics collector is set.
 
         Args:
             input_data: The input data to create embeddings for.
@@ -80,9 +79,9 @@ class EmbedderClient(ABC):
             from ..rate_limiting import ResourceType
 
             async with self.rate_limiter.limit(ResourceType.EMBEDDING):
-                result = await self.create(input_data)
+                result = await self._create_impl(input_data)
         else:
-            result = await self.create(input_data)
+            result = await self._create_impl(input_data)
 
         # Record metrics if collector is set
         if self.metrics_collector is not None:
@@ -90,11 +89,8 @@ class EmbedderClient(ABC):
 
         return result
 
-    async def create_batch_with_rate_limit(self, input_data_list: list[str]) -> list[list[float]]:
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         """Create batch embeddings with rate limiting and metrics applied.
-
-        This method wraps the create_batch method with rate limiting if a rate limiter is configured,
-        and records metrics if a metrics collector is set.
 
         Args:
             input_data_list: The list of input strings to create embeddings for.
@@ -106,9 +102,9 @@ class EmbedderClient(ABC):
             from ..rate_limiting import ResourceType
 
             async with self.rate_limiter.limit(ResourceType.EMBEDDING):
-                result = await self.create_batch(input_data_list)
+                result = await self._create_batch_impl(input_data_list)
         else:
-            result = await self.create_batch(input_data_list)
+            result = await self._create_batch_impl(input_data_list)
 
         # Record metrics if collector is set (count as 1 batch call)
         if self.metrics_collector is not None:
