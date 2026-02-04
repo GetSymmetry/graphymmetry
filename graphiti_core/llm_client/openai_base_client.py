@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import json
 import logging
+import random
 import time
 import typing
 from abc import abstractmethod
@@ -247,8 +249,28 @@ class BaseOpenAIClient(LLMClient):
                     if self.metrics_collector is not None:
                         await self.metrics_collector.record_llm_call(model_size)
                     return response
-                except (RateLimitError, RefusalError):
-                    # These errors should not trigger retries
+                except RateLimitError as e:
+                    last_error = e
+                    # Retry with exponential backoff for transient rate limits
+                    if retry_count < self.MAX_RETRIES:
+                        retry_count += 1
+                        retry_delay = (2 ** retry_count) + random.uniform(0, 0.1 * (2 ** retry_count))
+                        logger.warning(
+                            f'Rate limit error, retrying in {retry_delay:.2f}s (attempt {retry_count}/{self.MAX_RETRIES})',
+                            extra={'attempt': retry_count, 'retry_delay': retry_delay}
+                        )
+
+                        # Record retry in metrics if collector is set
+                        if self.metrics_collector is not None:
+                            await self.metrics_collector.record_retry()
+
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        span.set_status('error', f'Rate limit error after {self.MAX_RETRIES} retries')
+                        span.record_exception(e)
+                        raise
+                except RefusalError:
+                    # Content policy violations should not trigger retries
                     span.set_status('error', str(last_error))
                     raise
                 except (
