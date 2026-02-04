@@ -34,7 +34,7 @@ class AzureOpenAILLMClient(BaseOpenAIClient):
     """
 
     # Class-level constants
-    MAX_RETRIES: ClassVar[int] = 2
+    MAX_RETRIES: ClassVar[int] = 4
 
     def __init__(
         self,
