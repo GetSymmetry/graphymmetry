@@ -16,6 +16,7 @@ limitations under the License.
 
 import json
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
@@ -74,6 +75,7 @@ class LLMCallLogger:
         """
         self.log_path = Path(log_path)
         self.log_file = None
+        self._lock = threading.Lock()
 
     def log_call(
         self,
@@ -87,6 +89,8 @@ class LLMCallLogger:
 
         This method is called directly from LLM clients after each API call,
         providing accurate token counts from the response object.
+
+        Thread-safe: uses internal lock for concurrent write protection.
 
         Args:
             model: Name of the model used
@@ -104,8 +108,9 @@ class LLMCallLogger:
             'tokens_out': tokens_out,
         }
         if self.log_file:
-            self.log_file.write(json.dumps(log_entry) + '\n')
-            self.log_file.flush()
+            with self._lock:
+                self.log_file.write(json.dumps(log_entry) + '\n')
+                self.log_file.flush()
 
     @asynccontextmanager
     async def open(self):
