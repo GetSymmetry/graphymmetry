@@ -16,6 +16,7 @@ limitations under the License.
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -52,6 +53,7 @@ from graphiti_core.helpers import (
     validate_group_id,
 )
 from graphiti_core.llm_client import LLMClient, OpenAIClient
+from graphiti_core.llm_client.logging import LLMCallLogger, get_httpx_client_from_openai
 from graphiti_core.nodes import (
     CommunityNode,
     EntityNode,
@@ -854,6 +856,8 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        enable_llm_logging: bool = False,
+        llm_log_path: str | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -901,6 +905,13 @@ class Graphiti:
             query to find the most recent episode. Useful for efficiently adding multiple episodes
             to the same saga in sequence. The returned AddEpisodeResults.episode.uuid can be passed
             as this parameter for the next episode.
+        enable_llm_logging : bool
+            Optional. Enable detailed logging of all LLM API calls for this episode.
+            Logs are written to JSONL format (one JSON object per line) with request/response
+            metadata including timestamp, model, duration, and status. Defaults to False.
+        llm_log_path : str | None
+            Optional. Path to JSONL file for logging LLM calls. Required if enable_llm_logging=True.
+            Example: "logs/llm_calls_episode_001_20260203_103045.jsonl"
 
         Returns
         -------
@@ -946,10 +957,31 @@ class Graphiti:
                 self.driver = self.driver.clone(database=group_id)
                 self.clients.driver = self.driver
 
+        # Set up LLM call logging if enabled
+        llm_logging_context = nullcontext()
+        if enable_llm_logging:
+            if not llm_log_path:
+                raise ValueError(
+                    'llm_log_path required when enable_llm_logging=True. '
+                    'Example: llm_log_path="logs/llm_calls_episode_001.jsonl"'
+                )
+
+            # Try to get httpx client from LLM client for instrumentation
+            httpx_client = await get_httpx_client_from_openai(self.llm_client.client)
+            if httpx_client:
+                llm_logger = LLMCallLogger(llm_log_path)
+                llm_logging_context = llm_logger.enable(httpx_client)
+            else:
+                logger.warning(
+                    'Could not enable LLM logging: httpx client not found in LLM client. '
+                    'Logging will be skipped for this episode.'
+                )
+
         with self.tracer.start_span('add_episode') as span:
-            try:
-                # Retrieve previous episodes for context
-                previous_episodes = (
+            async with llm_logging_context:
+                try:
+                    # Retrieve previous episodes for context
+                    previous_episodes = (
                     await self.retrieve_episodes(
                         reference_time,
                         last_n=RELEVANT_SCHEMA_LIMIT,
@@ -958,10 +990,10 @@ class Graphiti:
                     )
                     if previous_episode_uuids is None
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
-                )
+                    )
 
-                # Get or create episode
-                episode = (
+                    # Get or create episode
+                    episode = (
                     await EpisodicNode.get_by_uuid(self.driver, uuid)
                     if uuid is not None
                     else EpisodicNode(
@@ -974,35 +1006,35 @@ class Graphiti:
                         created_at=now,
                         valid_at=reference_time,
                     )
-                )
+                    )
 
-                # Create default edge type map
-                edge_type_map_default = (
+                    # Create default edge type map
+                    edge_type_map_default = (
                     {('Entity', 'Entity'): list(edge_types.keys())}
                     if edge_types is not None
                     else {('Entity', 'Entity'): []}
-                )
+                    )
 
-                # Extract and resolve nodes
-                extracted_nodes = await extract_nodes(
+                    # Extract and resolve nodes
+                    extracted_nodes = await extract_nodes(
                     self.clients,
                     episode,
                     previous_episodes,
                     entity_types,
                     excluded_entity_types,
                     custom_extraction_instructions,
-                )
+                    )
 
-                nodes, uuid_map, _ = await resolve_extracted_nodes(
+                    nodes, uuid_map, _ = await resolve_extracted_nodes(
                     self.clients,
                     extracted_nodes,
                     episode,
                     previous_episodes,
                     entity_types,
-                )
+                    )
 
-                # Extract and resolve edges in parallel with attribute extraction
-                resolved_edges, invalidated_edges = await self._extract_and_resolve_edges(
+                    # Extract and resolve edges in parallel with attribute extraction
+                    resolved_edges, invalidated_edges = await self._extract_and_resolve_edges(
                     episode,
                     extracted_nodes,
                     previous_episodes,
@@ -1012,22 +1044,22 @@ class Graphiti:
                     nodes,
                     uuid_map,
                     custom_extraction_instructions,
-                )
+                    )
 
-                entity_edges = resolved_edges + invalidated_edges
+                    entity_edges = resolved_edges + invalidated_edges
 
-                # Extract node attributes
-                hydrated_nodes = await extract_attributes_from_nodes(
+                    # Extract node attributes
+                    hydrated_nodes = await extract_attributes_from_nodes(
                     self.clients,
                     nodes,
                     episode,
                     previous_episodes,
                     entity_types,
                     edges=entity_edges,
-                )
+                    )
 
-                # Process and save episode data (including saga association if provided)
-                episodic_edges, episode = await self._process_episode_data(
+                    # Process and save episode data (including saga association if provided)
+                    episodic_edges, episode = await self._process_episode_data(
                     episode,
                     hydrated_nodes,
                     entity_edges,
@@ -1035,24 +1067,24 @@ class Graphiti:
                     group_id,
                     saga,
                     saga_previous_episode_uuid,
-                )
-
-                # Update communities if requested
-                communities = []
-                community_edges = []
-                if update_communities:
-                    communities, community_edges = await semaphore_gather(
-                        *[
-                            update_community(self.driver, self.llm_client, self.embedder, node)
-                            for node in nodes
-                        ],
-                        max_coroutines=self.max_coroutines,
                     )
 
-                end = time()
+                    # Update communities if requested
+                    communities = []
+                    community_edges = []
+                    if update_communities:
+                        communities, community_edges = await semaphore_gather(
+                            *[
+                                update_community(self.driver, self.llm_client, self.embedder, node)
+                                for node in nodes
+                            ],
+                            max_coroutines=self.max_coroutines,
+                        )
 
-                # Add span attributes
-                span.add_attributes(
+                    end = time()
+
+                    # Add span attributes
+                    span.add_attributes(
                     {
                         'episode.uuid': episode.uuid,
                         'episode.source': source.value,
@@ -1068,38 +1100,38 @@ class Graphiti:
                         'communities.count': len(communities) if update_communities else 0,
                         'duration_ms': (end - start) * 1000,
                     }
-                )
+                    )
 
-                logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
+                    logger.info(f'Completed add_episode in {(end - start) * 1000} ms')
 
-                # Finalize metrics
-                metrics_collector.episode_id = episode.uuid
-                episode_metrics = metrics_collector.finalize(
+                    # Finalize metrics
+                    metrics_collector.episode_id = episode.uuid
+                    episode_metrics = metrics_collector.finalize(
                     entities_count=len(hydrated_nodes),
                     edges_count=len(entity_edges),
-                )
+                    )
 
-                # Clean up metrics collectors
-                self.llm_client.set_metrics_collector(None)
-                self.embedder.set_metrics_collector(None)
+                    # Clean up metrics collectors
+                    self.llm_client.set_metrics_collector(None)
+                    self.embedder.set_metrics_collector(None)
 
-                return AddEpisodeResults(
-                    episode=episode,
-                    episodic_edges=episodic_edges,
-                    nodes=hydrated_nodes,
-                    edges=entity_edges,
-                    communities=communities,
-                    community_edges=community_edges,
-                    metrics=episode_metrics,
-                )
+                    return AddEpisodeResults(
+                        episode=episode,
+                        episodic_edges=episodic_edges,
+                        nodes=hydrated_nodes,
+                        edges=entity_edges,
+                        communities=communities,
+                        community_edges=community_edges,
+                        metrics=episode_metrics,
+                    )
 
-            except Exception as e:
-                # Clean up metrics collectors on error
-                self.llm_client.set_metrics_collector(None)
-                self.embedder.set_metrics_collector(None)
-                span.set_status('error', str(e))
-                span.record_exception(e)
-                raise e
+                except Exception as e:
+                    # Clean up metrics collectors on error
+                    self.llm_client.set_metrics_collector(None)
+                    self.embedder.set_metrics_collector(None)
+                    span.set_status('error', str(e))
+                    span.record_exception(e)
+                    raise e
 
     async def add_episode_bulk(
         self,
