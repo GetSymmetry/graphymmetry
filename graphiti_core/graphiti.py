@@ -651,6 +651,7 @@ class Graphiti:
         entity_types: dict[str, type[BaseModel]] | None,
         excluded_entity_types: list[str] | None,
         custom_extraction_instructions: str | None = None,
+        stagger_delay: float = 0.0,
     ) -> tuple[
         dict[str, list[EntityNode]],
         dict[str, str],
@@ -666,6 +667,7 @@ class Graphiti:
             entity_types=entity_types,
             excluded_entity_types=excluded_entity_types,
             custom_extraction_instructions=custom_extraction_instructions,
+            stagger_delay=stagger_delay,
         )
 
         # Dedupe extracted nodes in memory
@@ -1153,6 +1155,7 @@ class Graphiti:
         saga: str | SagaNode | None = None,
         enable_llm_logging: bool = False,
         llm_log_path: str | None = None,
+        stagger_delay: float = 0.0,
     ) -> AddBulkEpisodeResults:
         """
         Process multiple episodes in bulk and update the graph.
@@ -1194,6 +1197,11 @@ class Graphiti:
             Example: llm_log_path="logs/bulk_20260204_123456" produces:
                 logs/bulk_20260204_123456_episode_chunk_001.jsonl
                 logs/bulk_20260204_123456_episode_chunk_002.jsonl
+        stagger_delay : float
+            Optional. Delay in seconds between starting extraction for each episode.
+            This spreads out bursts of concurrent LLM requests to avoid rate limiting.
+            With stagger_delay=6.0 and 20 episodes, extraction starts at 0s, 6s, 12s, etc.
+            Applies to both node and edge extraction phases. Defaults to 0.0 (no staggering).
 
         Returns
         -------
@@ -1308,6 +1316,7 @@ class Graphiti:
                         entity_types,
                         excluded_entity_types,
                         custom_extraction_instructions,
+                        stagger_delay,
                     )
 
                     # Create Episodic Edges

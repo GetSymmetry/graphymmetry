@@ -49,7 +49,7 @@ class BaseOpenAIClient(LLMClient):
     """
 
     # Class-level constants
-    MAX_RETRIES: ClassVar[int] = 2
+    MAX_RETRIES: ClassVar[int] = 4
 
     def __init__(
         self,
@@ -254,7 +254,8 @@ class BaseOpenAIClient(LLMClient):
                     # Retry with exponential backoff for transient rate limits
                     if retry_count < self.MAX_RETRIES:
                         retry_count += 1
-                        retry_delay = (2 ** retry_count) + random.uniform(0, 0.1 * (2 ** retry_count))
+                        # Increased jitter from 0.1x to 1.0x to desynchronize concurrent retries
+                        retry_delay = (2 ** retry_count) + random.uniform(0, 1.0 * (2 ** retry_count))
                         logger.warning(
                             f'Rate limit error, retrying in {retry_delay:.2f}s (attempt {retry_count}/{self.MAX_RETRIES})',
                             extra={'attempt': retry_count, 'retry_delay': retry_delay}

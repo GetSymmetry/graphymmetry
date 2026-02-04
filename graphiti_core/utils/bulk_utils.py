@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import json
 import logging
 import typing
@@ -259,33 +260,53 @@ async def extract_nodes_and_edges_bulk(
     excluded_entity_types: list[str] | None = None,
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
+    stagger_delay: float = 0.0,
 ) -> tuple[list[list[EntityNode]], list[list[EntityEdge]]]:
+    async def extract_nodes_with_stagger(
+        i: int,
+        episode: EpisodicNode,
+        previous_episodes: list[EpisodicNode],
+    ) -> list[EntityNode]:
+        if stagger_delay > 0 and i > 0:
+            await asyncio.sleep(i * stagger_delay)
+        return await extract_nodes(
+            clients,
+            episode,
+            previous_episodes,
+            entity_types=entity_types,
+            excluded_entity_types=excluded_entity_types,
+            custom_extraction_instructions=custom_extraction_instructions,
+        )
+
     extracted_nodes_bulk: list[list[EntityNode]] = await semaphore_gather(
         *[
-            extract_nodes(
-                clients,
-                episode,
-                previous_episodes,
-                entity_types=entity_types,
-                excluded_entity_types=excluded_entity_types,
-                custom_extraction_instructions=custom_extraction_instructions,
-            )
-            for episode, previous_episodes in episode_tuples
+            extract_nodes_with_stagger(i, episode, previous_episodes)
+            for i, (episode, previous_episodes) in enumerate(episode_tuples)
         ]
     )
 
+    async def extract_edges_with_stagger(
+        i: int,
+        episode: EpisodicNode,
+        nodes: list[EntityNode],
+        previous_episodes: list[EpisodicNode],
+    ) -> list[EntityEdge]:
+        if stagger_delay > 0 and i > 0:
+            await asyncio.sleep(i * stagger_delay)
+        return await extract_edges(
+            clients,
+            episode,
+            nodes,
+            previous_episodes,
+            edge_type_map=edge_type_map,
+            group_id=episode.group_id,
+            edge_types=edge_types,
+            custom_extraction_instructions=custom_extraction_instructions,
+        )
+
     extracted_edges_bulk: list[list[EntityEdge]] = await semaphore_gather(
         *[
-            extract_edges(
-                clients,
-                episode,
-                extracted_nodes_bulk[i],
-                previous_episodes,
-                edge_type_map=edge_type_map,
-                group_id=episode.group_id,
-                edge_types=edge_types,
-                custom_extraction_instructions=custom_extraction_instructions,
-            )
+            extract_edges_with_stagger(i, episode, extracted_nodes_bulk[i], previous_episodes)
             for i, (episode, previous_episodes) in enumerate(episode_tuples)
         ]
     )
