@@ -18,13 +18,45 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Context variable for async-safe per-task call logger storage
+# This allows each async task (e.g., parallel episode processing) to have
+# its own isolated logger without race conditions on shared client instances
+_call_logger_var: ContextVar['LLMCallLogger | None'] = ContextVar('call_logger', default=None)
+
+
+def get_call_logger() -> 'LLMCallLogger | None':
+    """Get the current task's call logger from context."""
+    return _call_logger_var.get()
+
+
+def set_call_logger(logger: 'LLMCallLogger | None') -> Token:
+    """Set the call logger for the current task context.
+
+    Args:
+        logger: The LLMCallLogger to use, or None to disable call logging.
+
+    Returns:
+        A token that can be used with reset_call_logger() to restore the previous value.
+    """
+    return _call_logger_var.set(logger)
+
+
+def reset_call_logger(token: Token) -> None:
+    """Reset the call logger to its previous value using the token from set_call_logger().
+
+    Args:
+        token: The token returned from set_call_logger().
+    """
+    _call_logger_var.reset(token)
 
 
 class LLMCallLogger:

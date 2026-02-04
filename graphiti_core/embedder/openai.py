@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import time
 from collections.abc import Iterable
 
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -55,13 +56,39 @@ class OpenAIEmbedder(EmbedderClient):
     async def _create_impl(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
+        start_time = time.time()
         result = await self.client.embeddings.create(
             input=input_data, model=self.config.embedding_model
         )
+
+        # Log tokens if call logger is set (embeddings only have input tokens)
+        if self._call_logger is not None:
+            usage = getattr(result, 'usage', None)
+            if usage is not None:
+                self._call_logger.log_call(
+                    model=str(self.config.embedding_model),
+                    duration_ms=(time.time() - start_time) * 1000,
+                    tokens_in=getattr(usage, 'prompt_tokens', 0) or 0,
+                    tokens_out=0,  # Embeddings don't have output tokens
+                )
+
         return result.data[0].embedding[: self.config.embedding_dim]
 
     async def _create_batch_impl(self, input_data_list: list[str]) -> list[list[float]]:
+        start_time = time.time()
         result = await self.client.embeddings.create(
             input=input_data_list, model=self.config.embedding_model
         )
+
+        # Log tokens if call logger is set (embeddings only have input tokens)
+        if self._call_logger is not None:
+            usage = getattr(result, 'usage', None)
+            if usage is not None:
+                self._call_logger.log_call(
+                    model=str(self.config.embedding_model),
+                    duration_ms=(time.time() - start_time) * 1000,
+                    tokens_in=getattr(usage, 'prompt_tokens', 0) or 0,
+                    tokens_out=0,  # Embeddings don't have output tokens
+                )
+
         return [embedding.embedding[: self.config.embedding_dim] for embedding in result.data]

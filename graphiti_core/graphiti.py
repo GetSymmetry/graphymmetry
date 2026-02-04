@@ -958,8 +958,11 @@ class Graphiti:
                 self.clients.driver = self.driver
 
         # Set up LLM call logging if enabled
+        # Tokens are used to reset the contextvar to its previous value after processing
         llm_logging_context = nullcontext()
         llm_logger = None
+        llm_logger_token = None
+        emb_logger_token = None
         if enable_llm_logging:
             if not llm_log_path:
                 raise ValueError(
@@ -967,9 +970,11 @@ class Graphiti:
                     'Example: llm_log_path="logs/llm_calls_episode_001.jsonl"'
                 )
 
-            # Create logger and attach to LLM client for token tracking
+            # Create logger and set in task context for token tracking
+            # Using contextvar ensures each parallel task has its own isolated logger
             llm_logger = LLMCallLogger(llm_log_path)
-            self.llm_client.set_call_logger(llm_logger)
+            llm_logger_token = self.llm_client.set_call_logger(llm_logger)
+            emb_logger_token = self.embedder.set_call_logger(llm_logger)
             llm_logging_context = llm_logger.open()
 
         with self.tracer.start_span('add_episode') as span:
@@ -1106,10 +1111,13 @@ class Graphiti:
                     edges_count=len(entity_edges),
                     )
 
-                    # Clean up metrics collectors and call logger
+                    # Clean up metrics collectors and call loggers
                     self.llm_client.set_metrics_collector(None)
                     self.embedder.set_metrics_collector(None)
-                    self.llm_client.set_call_logger(None)
+                    if llm_logger_token is not None:
+                        self.llm_client.reset_call_logger(llm_logger_token)
+                    if emb_logger_token is not None:
+                        self.embedder.reset_call_logger(emb_logger_token)
 
                     return AddEpisodeResults(
                         episode=episode,
@@ -1122,10 +1130,13 @@ class Graphiti:
                     )
 
                 except Exception as e:
-                    # Clean up metrics collectors and call logger on error
+                    # Clean up metrics collectors and call loggers on error
                     self.llm_client.set_metrics_collector(None)
                     self.embedder.set_metrics_collector(None)
-                    self.llm_client.set_call_logger(None)
+                    if llm_logger_token is not None:
+                        self.llm_client.reset_call_logger(llm_logger_token)
+                    if emb_logger_token is not None:
+                        self.embedder.reset_call_logger(emb_logger_token)
                     span.set_status('error', str(e))
                     span.record_exception(e)
                     raise e

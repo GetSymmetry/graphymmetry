@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
+    from contextvars import Token
+
     from .logging import LLMCallLogger
 from diskcache import Cache
 from pydantic import BaseModel
@@ -114,7 +116,6 @@ class LLMClient(ABC):
         self.tracer: Tracer = NoOpTracer()
         self.rate_limiter: RateLimiter | None = None
         self.metrics_collector: MetricsCollector | None = None
-        self._call_logger: 'LLMCallLogger | None' = None
 
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
@@ -140,13 +141,43 @@ class LLMClient(ABC):
         """
         self.metrics_collector = collector
 
-    def set_call_logger(self, logger: 'LLMCallLogger | None') -> None:
+    @property
+    def _call_logger(self) -> 'LLMCallLogger | None':
+        """Get the current task's call logger from context.
+
+        This property reads from a contextvar, making it safe for concurrent
+        async tasks (e.g., parallel episode processing) to each have their
+        own isolated logger.
+        """
+        from .logging import get_call_logger
+
+        return get_call_logger()
+
+    def set_call_logger(self, logger: 'LLMCallLogger | None') -> 'Token':
         """Set the call logger for JSONL logging of LLM calls.
+
+        This sets the logger in the current task's context, making it safe
+        for concurrent async tasks to each have their own isolated logger.
 
         Args:
             logger: The LLMCallLogger to use, or None to disable call logging.
+
+        Returns:
+            A token that can be used with reset_call_logger() to restore the previous value.
         """
-        self._call_logger = logger
+        from .logging import set_call_logger
+
+        return set_call_logger(logger)
+
+    def reset_call_logger(self, token: 'Token') -> None:
+        """Reset the call logger to its previous value.
+
+        Args:
+            token: The token returned from set_call_logger().
+        """
+        from .logging import reset_call_logger
+
+        reset_call_logger(token)
 
     def _get_resource_type(self, model_size: ModelSize) -> ResourceType:
         """Map model size to rate limiter resource type."""

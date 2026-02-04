@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import time
 from typing import Any
 
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -41,6 +42,7 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
 
     async def _create_impl(self, input_data: str | list[str] | Any) -> list[float]:
         """Create embeddings using Azure OpenAI client."""
+        start_time = time.time()
         try:
             # Handle different input types
             if isinstance(input_data, str):
@@ -53,6 +55,17 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
 
             response = await self.azure_client.embeddings.create(model=self.model, input=text_input)
 
+            # Log tokens if call logger is set (embeddings only have input tokens)
+            if self._call_logger is not None:
+                usage = getattr(response, 'usage', None)
+                if usage is not None:
+                    self._call_logger.log_call(
+                        model=self.model,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        tokens_in=getattr(usage, 'prompt_tokens', 0) or 0,
+                        tokens_out=0,  # Embeddings don't have output tokens
+                    )
+
             # Return the first embedding as a list of floats
             return response.data[0].embedding
         except Exception as e:
@@ -61,10 +74,22 @@ class AzureOpenAIEmbedderClient(EmbedderClient):
 
     async def _create_batch_impl(self, input_data_list: list[str]) -> list[list[float]]:
         """Create batch embeddings using Azure OpenAI client."""
+        start_time = time.time()
         try:
             response = await self.azure_client.embeddings.create(
                 model=self.model, input=input_data_list
             )
+
+            # Log tokens if call logger is set (embeddings only have input tokens)
+            if self._call_logger is not None:
+                usage = getattr(response, 'usage', None)
+                if usage is not None:
+                    self._call_logger.log_call(
+                        model=self.model,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        tokens_in=getattr(usage, 'prompt_tokens', 0) or 0,
+                        tokens_out=0,  # Embeddings don't have output tokens
+                    )
 
             return [embedding.embedding for embedding in response.data]
         except Exception as e:
