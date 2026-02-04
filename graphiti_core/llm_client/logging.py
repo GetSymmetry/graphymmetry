@@ -112,6 +112,39 @@ class LLMCallLogger:
                 self.log_file.write(json.dumps(log_entry) + '\n')
                 self.log_file.flush()
 
+    def log_retry(
+        self,
+        model: str,
+        attempt: int,
+        max_retries: int,
+        retry_delay: float,
+        error_type: str = 'rate_limit',
+    ) -> None:
+        """Log a retry attempt before it happens.
+
+        Thread-safe: uses internal lock for concurrent write protection.
+
+        Args:
+            model: Name of the model that triggered retry
+            attempt: Current retry attempt number (1-indexed)
+            max_retries: Maximum retries configured
+            retry_delay: Delay in seconds before retry
+            error_type: Type of error triggering retry ('rate_limit' or 'transient')
+        """
+        log_entry = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'event': 'retry',  # Distinguishes from regular calls
+            'model': model,
+            'error_type': error_type,
+            'attempt': attempt,
+            'max_retries': max_retries,
+            'retry_delay_s': round(retry_delay, 2),
+        }
+        if self.log_file:
+            with self._lock:
+                self.log_file.write(json.dumps(log_entry) + '\n')
+                self.log_file.flush()
+
     @asynccontextmanager
     async def open(self):
         """Open logger for direct logging without httpx hooks.

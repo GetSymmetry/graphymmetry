@@ -49,7 +49,7 @@ class BaseOpenAIClient(LLMClient):
     """
 
     # Class-level constants
-    MAX_RETRIES: ClassVar[int] = 4
+    MAX_RETRIES: ClassVar[int] = 6
 
     def __init__(
         self,
@@ -255,11 +255,18 @@ class BaseOpenAIClient(LLMClient):
                     if retry_count < self.MAX_RETRIES:
                         retry_count += 1
                         # Increased jitter from 0.1x to 1.0x to desynchronize concurrent retries
-                        retry_delay = (2 ** retry_count) + random.uniform(0, 1.0 * (2 ** retry_count))
-                        logger.warning(
-                            f'Rate limit error, retrying in {retry_delay:.2f}s (attempt {retry_count}/{self.MAX_RETRIES})',
-                            extra={'attempt': retry_count, 'retry_delay': retry_delay}
-                        )
+                        # Doubled initial delay (2^(n+1) instead of 2^n) for better rate limit handling
+                        retry_delay = (5 ** (retry_count + 1)) + random.uniform(0, 1.0 * (2 ** (retry_count + 1)))
+
+                        # Log to structured log instead of console
+                        if self._call_logger is not None:
+                            self._call_logger.log_retry(
+                                model=self._get_model_for_size(model_size),
+                                attempt=retry_count,
+                                max_retries=self.MAX_RETRIES,
+                                retry_delay=retry_delay,
+                                error_type='rate_limit',
+                            )
 
                         # Record retry in metrics if collector is set
                         if self.metrics_collector is not None:
@@ -293,6 +300,16 @@ class BaseOpenAIClient(LLMClient):
                         raise
 
                     retry_count += 1
+
+                    # Log retry to structured log
+                    if self._call_logger is not None:
+                        self._call_logger.log_retry(
+                            model=self._get_model_for_size(model_size),
+                            attempt=retry_count,
+                            max_retries=self.MAX_RETRIES,
+                            retry_delay=0.0,  # No explicit delay for general errors
+                            error_type='transient',
+                        )
 
                     # Record retry in metrics if collector is set
                     if self.metrics_collector is not None:
