@@ -17,6 +17,7 @@ limitations under the License.
 import json
 import logging
 import os
+import time
 import typing
 from json import JSONDecodeError
 from typing import TYPE_CHECKING, Literal
@@ -281,6 +282,7 @@ class AnthropicClient(LLMClient):
         # Resolve max_tokens dynamically based on the model's capabilities
         # This allows different models to use their full output capacity
         max_creation_tokens: int = self._resolve_max_tokens(max_tokens, self.model)
+        start_time = time.time()
 
         try:
             # Create the appropriate tool based on whether response_model is provided
@@ -294,6 +296,16 @@ class AnthropicClient(LLMClient):
                 tools=tools,
                 tool_choice=tool_choice,
             )
+
+            # Log tokens if call logger is set
+            if self._call_logger is not None and hasattr(result, 'usage'):
+                usage = result.usage
+                self._call_logger.log_call(
+                    model=self.model,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    tokens_in=getattr(usage, 'input_tokens', 0) or 0,
+                    tokens_out=getattr(usage, 'output_tokens', 0) or 0,
+                )
 
             # Extract the tool output from the response
             for content_item in result.content:

@@ -43,6 +43,59 @@ class LLMCallLogger:
         self.log_path = Path(log_path)
         self.log_file = None
 
+    def log_call(
+        self,
+        model: str,
+        duration_ms: float,
+        tokens_in: int,
+        tokens_out: int,
+        status: int = 200,
+    ) -> None:
+        """Log an LLM call with token usage.
+
+        This method is called directly from LLM clients after each API call,
+        providing accurate token counts from the response object.
+
+        Args:
+            model: Name of the model used
+            duration_ms: Request duration in milliseconds
+            tokens_in: Number of input/prompt tokens
+            tokens_out: Number of output/completion tokens
+            status: HTTP status code (default 200)
+        """
+        log_entry = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'model': model,
+            'duration_ms': round(duration_ms, 2),
+            'status': status,
+            'tokens_in': tokens_in,
+            'tokens_out': tokens_out,
+        }
+        if self.log_file:
+            self.log_file.write(json.dumps(log_entry) + '\n')
+            self.log_file.flush()
+
+    @asynccontextmanager
+    async def open(self):
+        """Open logger for direct logging without httpx hooks.
+
+        Use this context manager when logging from LLM client level
+        rather than via httpx event hooks.
+
+        Example:
+            >>> logger = LLMCallLogger("logs/llm_calls.jsonl")
+            >>> async with logger.open():
+            ...     logger.log_call(model="gpt-4", duration_ms=100, tokens_in=50, tokens_out=20)
+        """
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file = open(self.log_path, 'a')
+        try:
+            yield self
+        finally:
+            if self.log_file:
+                self.log_file.close()
+                self.log_file = None
+
     async def _log_request(self, request: httpx.Request) -> None:
         """Hook called before request is sent.
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 import json
 import logging
+import time
 import typing
 from abc import abstractmethod
 from typing import Any, ClassVar
@@ -139,6 +140,7 @@ class BaseOpenAIClient(LLMClient):
         """Generate a response using the appropriate client implementation."""
         openai_messages = self._convert_messages_to_openai_format(messages)
         model = self._get_model_for_size(model_size)
+        start_time = time.time()
 
         try:
             if response_model:
@@ -151,7 +153,7 @@ class BaseOpenAIClient(LLMClient):
                     reasoning=self.reasoning,
                     verbosity=self.verbosity,
                 )
-                return self._handle_structured_response(response)
+                result = self._handle_structured_response(response)
             else:
                 response = await self._create_completion(
                     model=model,
@@ -159,7 +161,32 @@ class BaseOpenAIClient(LLMClient):
                     temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
                 )
-                return self._handle_json_response(response)
+                result = self._handle_json_response(response)
+
+            # Log tokens if call logger is set
+            if self._call_logger is not None:
+                usage = getattr(response, 'usage', None)
+                if usage is not None:
+                    # Handle both Chat Completions API (prompt_tokens/completion_tokens)
+                    # and Responses API (input_tokens/output_tokens)
+                    tokens_in = (
+                        getattr(usage, 'prompt_tokens', None)
+                        or getattr(usage, 'input_tokens', None)
+                        or 0
+                    )
+                    tokens_out = (
+                        getattr(usage, 'completion_tokens', None)
+                        or getattr(usage, 'output_tokens', None)
+                        or 0
+                    )
+                    self._call_logger.log_call(
+                        model=model,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                    )
+
+            return result
 
         except openai.LengthFinishReasonError as e:
             raise Exception(f'Output length exceeded max tokens {self.max_tokens}: {e}') from e

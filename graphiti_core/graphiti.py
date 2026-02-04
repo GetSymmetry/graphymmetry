@@ -53,7 +53,7 @@ from graphiti_core.helpers import (
     validate_group_id,
 )
 from graphiti_core.llm_client import LLMClient, OpenAIClient
-from graphiti_core.llm_client.logging import LLMCallLogger, get_httpx_client_from_openai
+from graphiti_core.llm_client.logging import LLMCallLogger
 from graphiti_core.nodes import (
     CommunityNode,
     EntityNode,
@@ -959,6 +959,7 @@ class Graphiti:
 
         # Set up LLM call logging if enabled
         llm_logging_context = nullcontext()
+        llm_logger = None
         if enable_llm_logging:
             if not llm_log_path:
                 raise ValueError(
@@ -966,16 +967,10 @@ class Graphiti:
                     'Example: llm_log_path="logs/llm_calls_episode_001.jsonl"'
                 )
 
-            # Try to get httpx client from LLM client for instrumentation
-            httpx_client = await get_httpx_client_from_openai(self.llm_client.client)
-            if httpx_client:
-                llm_logger = LLMCallLogger(llm_log_path)
-                llm_logging_context = llm_logger.enable(httpx_client)
-            else:
-                logger.warning(
-                    'Could not enable LLM logging: httpx client not found in LLM client. '
-                    'Logging will be skipped for this episode.'
-                )
+            # Create logger and attach to LLM client for token tracking
+            llm_logger = LLMCallLogger(llm_log_path)
+            self.llm_client.set_call_logger(llm_logger)
+            llm_logging_context = llm_logger.open()
 
         with self.tracer.start_span('add_episode') as span:
             async with llm_logging_context:
@@ -1111,9 +1106,10 @@ class Graphiti:
                     edges_count=len(entity_edges),
                     )
 
-                    # Clean up metrics collectors
+                    # Clean up metrics collectors and call logger
                     self.llm_client.set_metrics_collector(None)
                     self.embedder.set_metrics_collector(None)
+                    self.llm_client.set_call_logger(None)
 
                     return AddEpisodeResults(
                         episode=episode,
@@ -1126,9 +1122,10 @@ class Graphiti:
                     )
 
                 except Exception as e:
-                    # Clean up metrics collectors on error
+                    # Clean up metrics collectors and call logger on error
                     self.llm_client.set_metrics_collector(None)
                     self.embedder.set_metrics_collector(None)
+                    self.llm_client.set_call_logger(None)
                     span.set_status('error', str(e))
                     span.record_exception(e)
                     raise e

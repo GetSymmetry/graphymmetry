@@ -17,6 +17,7 @@ limitations under the License.
 import json
 import logging
 import re
+import time
 import typing
 from typing import TYPE_CHECKING, ClassVar
 
@@ -253,6 +254,7 @@ class GeminiClient(LLMClient):
             RateLimitError: If the API rate limit is exceeded.
             Exception: If there is an error generating the response or content is blocked.
         """
+        start_time = time.time()
         try:
             gemini_messages: typing.Any = []
             # If a response model is provided, add schema for structured output
@@ -302,6 +304,17 @@ class GeminiClient(LLMClient):
                 contents=gemini_messages,
                 config=generation_config,
             )
+
+            # Log tokens if call logger is set
+            if self._call_logger is not None:
+                usage_metadata = getattr(response, 'usage_metadata', None)
+                if usage_metadata is not None:
+                    self._call_logger.log_call(
+                        model=model,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        tokens_in=getattr(usage_metadata, 'prompt_token_count', 0) or 0,
+                        tokens_out=getattr(usage_metadata, 'candidates_token_count', 0) or 0,
+                    )
 
             # Always capture the raw output for debugging
             raw_output = getattr(response, 'text', None)

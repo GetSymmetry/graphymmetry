@@ -16,6 +16,7 @@ limitations under the License.
 
 import json
 import logging
+import time
 import typing
 from typing import TYPE_CHECKING
 
@@ -68,6 +69,7 @@ class GroqClient(LLMClient):
                 msgs.append({'role': 'user', 'content': m.content})
             elif m.role == 'system':
                 msgs.append({'role': 'system', 'content': m.content})
+        start_time = time.time()
         try:
             response = await self.client.chat.completions.create(
                 model=self.model or DEFAULT_MODEL,
@@ -76,6 +78,18 @@ class GroqClient(LLMClient):
                 max_tokens=max_tokens or self.max_tokens,
                 response_format={'type': 'json_object'},
             )
+
+            # Log tokens if call logger is set (Groq uses OpenAI-compatible format)
+            if self._call_logger is not None:
+                usage = getattr(response, 'usage', None)
+                if usage is not None:
+                    self._call_logger.log_call(
+                        model=self.model or DEFAULT_MODEL,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        tokens_in=getattr(usage, 'prompt_tokens', 0) or 0,
+                        tokens_out=getattr(usage, 'completion_tokens', 0) or 0,
+                    )
+
             result = response.choices[0].message.content or ''
             return json.loads(result)
         except groq.RateLimitError as e:

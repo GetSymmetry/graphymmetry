@@ -19,8 +19,12 @@ import json
 import logging
 import typing
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from .logging import LLMCallLogger
 from diskcache import Cache
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
@@ -110,6 +114,7 @@ class LLMClient(ABC):
         self.tracer: Tracer = NoOpTracer()
         self.rate_limiter: RateLimiter | None = None
         self.metrics_collector: MetricsCollector | None = None
+        self._call_logger: 'LLMCallLogger | None' = None
 
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
@@ -134,6 +139,14 @@ class LLMClient(ABC):
             collector: The metrics collector to use, or None to disable metrics collection.
         """
         self.metrics_collector = collector
+
+    def set_call_logger(self, logger: 'LLMCallLogger | None') -> None:
+        """Set the call logger for JSONL logging of LLM calls.
+
+        Args:
+            logger: The LLMCallLogger to use, or None to disable call logging.
+        """
+        self._call_logger = logger
 
     def _get_resource_type(self, model_size: ModelSize) -> ResourceType:
         """Map model size to rate limiter resource type."""
