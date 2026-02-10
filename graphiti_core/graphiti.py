@@ -860,6 +860,7 @@ class Graphiti:
         saga_previous_episode_uuid: str | None = None,
         enable_llm_logging: bool = False,
         llm_log_path: str | None = None,
+        llm_logger: LLMCallLogger | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -912,8 +913,12 @@ class Graphiti:
             Logs are written to JSONL format (one JSON object per line) with request/response
             metadata including timestamp, model, duration, and status. Defaults to False.
         llm_log_path : str | None
-            Optional. Path to JSONL file for logging LLM calls. Required if enable_llm_logging=True.
+            Optional. Path to JSONL file for logging LLM calls. Required if enable_llm_logging=True
+            and no llm_logger is provided.
             Example: "logs/llm_calls_episode_001_20260203_103045.jsonl"
+        llm_logger : LLMCallLogger | None
+            Optional. A pre-configured LLMCallLogger instance (e.g., with a custom sink for
+            telemetry). When provided, enable_llm_logging and llm_log_path are ignored.
 
         Returns
         -------
@@ -962,22 +967,23 @@ class Graphiti:
         # Set up LLM call logging if enabled
         # Tokens are used to reset the contextvar to its previous value after processing
         llm_logging_context = nullcontext()
-        llm_logger = None
+        _llm_logger = llm_logger  # Prefer caller-provided logger
         llm_logger_token = None
         emb_logger_token = None
-        if enable_llm_logging:
+        if _llm_logger is not None:
+            llm_logger_token = self.llm_client.set_call_logger(_llm_logger)
+            emb_logger_token = self.embedder.set_call_logger(_llm_logger)
+            llm_logging_context = _llm_logger.open()
+        elif enable_llm_logging:
             if not llm_log_path:
                 raise ValueError(
-                    'llm_log_path required when enable_llm_logging=True. '
+                    'llm_log_path required when enable_llm_logging=True and no llm_logger provided. '
                     'Example: llm_log_path="logs/llm_calls_episode_001.jsonl"'
                 )
-
-            # Create logger and set in task context for token tracking
-            # Using contextvar ensures each parallel task has its own isolated logger
-            llm_logger = LLMCallLogger(llm_log_path)
-            llm_logger_token = self.llm_client.set_call_logger(llm_logger)
-            emb_logger_token = self.embedder.set_call_logger(llm_logger)
-            llm_logging_context = llm_logger.open()
+            _llm_logger = LLMCallLogger(log_path=llm_log_path)
+            llm_logger_token = self.llm_client.set_call_logger(_llm_logger)
+            emb_logger_token = self.embedder.set_call_logger(_llm_logger)
+            llm_logging_context = _llm_logger.open()
 
         with self.tracer.start_span('add_episode') as span:
             async with llm_logging_context:
@@ -1155,6 +1161,7 @@ class Graphiti:
         saga: str | SagaNode | None = None,
         enable_llm_logging: bool = False,
         llm_log_path: str | None = None,
+        llm_logger: LLMCallLogger | None = None,
         stagger_delay: float = 0.0,
     ) -> AddBulkEpisodeResults:
         """
@@ -1191,12 +1198,16 @@ class Graphiti:
             Each episode will log to its own JSONL file. Logs include timestamp, model, duration,
             and token counts. Defaults to False.
         llm_log_path : str | None
-            Optional. Base path for logging LLM calls. Required if enable_llm_logging=True.
+            Optional. Base path for logging LLM calls. Required if enable_llm_logging=True
+            and no llm_logger is provided.
             Each episode will create a separate log file using the pattern:
             {llm_log_path}_episode_{episode_name}.jsonl
             Example: llm_log_path="logs/bulk_20260204_123456" produces:
                 logs/bulk_20260204_123456_episode_chunk_001.jsonl
                 logs/bulk_20260204_123456_episode_chunk_002.jsonl
+        llm_logger : LLMCallLogger | None
+            Optional. A pre-configured LLMCallLogger instance (e.g., with a custom sink for
+            telemetry). When provided, enable_llm_logging and llm_log_path are ignored.
         stagger_delay : float
             Optional. Delay in seconds between starting extraction for each episode.
             This spreads out bursts of concurrent LLM requests to avoid rate limiting.
@@ -1234,21 +1245,23 @@ class Graphiti:
 
         # Set up LLM call logging if enabled
         llm_logging_context = nullcontext()
+        _llm_logger = llm_logger  # Prefer caller-provided logger
         llm_logger_token = None
         emb_logger_token = None
-        if enable_llm_logging:
+        if _llm_logger is not None:
+            llm_logger_token = self.llm_client.set_call_logger(_llm_logger)
+            emb_logger_token = self.embedder.set_call_logger(_llm_logger)
+            llm_logging_context = _llm_logger.open()
+        elif enable_llm_logging:
             if not llm_log_path:
                 raise ValueError(
-                    'llm_log_path required when enable_llm_logging=True. '
+                    'llm_log_path required when enable_llm_logging=True and no llm_logger provided. '
                     'Example: llm_log_path="logs/bulk_20260204_123456.jsonl"'
                 )
-
-            # Create logger and set in task context
-            # Note: All episodes will log to the same file (thread-safe with internal locking)
-            llm_logger = LLMCallLogger(llm_log_path)
-            llm_logger_token = self.llm_client.set_call_logger(llm_logger)
-            emb_logger_token = self.embedder.set_call_logger(llm_logger)
-            llm_logging_context = llm_logger.open()
+            _llm_logger = LLMCallLogger(log_path=llm_log_path)
+            llm_logger_token = self.llm_client.set_call_logger(_llm_logger)
+            emb_logger_token = self.embedder.set_call_logger(_llm_logger)
+            llm_logging_context = _llm_logger.open()
 
         with self.tracer.start_span('add_episode_bulk') as bulk_span:
             bulk_span.add_attributes({'episode.count': len(bulk_episodes)})

@@ -14,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import json
 import logging
-import threading
-import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-import httpx
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -61,21 +58,43 @@ def reset_call_logger(token: Token) -> None:
 
 
 class LLMCallLogger:
-    """Logger for LLM API calls at the HTTP level.
+    """Non-blocking logger for LLM API calls.
 
-    Uses httpx event hooks to capture request/response metadata for profiling.
-    Logs to JSONL format (one JSON object per line).
+    All log entries are enqueued and processed by a background asyncio task,
+    so logging never blocks the caller. Entries are routed to a sink function
+    which is either a custom callable (for telemetry, Application Insights, etc.)
+    or an internal file sink that writes JSONL.
+
+    Provide exactly one of ``log_path`` or ``sink`` (mutually exclusive).
+
+    Args:
+        log_path: Path to JSONL file for logging. Creates an internal file sink.
+        sink: Custom callable that receives log entry dicts. Must accept a single
+            ``dict`` argument. Does not need to be thread-safe — it is only ever
+            called from the background drain task.
     """
 
-    def __init__(self, log_path: str):
-        """Initialize logger with output path.
+    def __init__(
+        self,
+        log_path: str | None = None,
+        sink: Callable[[dict], None] | None = None,
+    ):
+        if log_path and sink:
+            raise ValueError('Provide log_path or sink, not both.')
+        if not log_path and not sink:
+            raise ValueError('Provide either log_path or sink.')
 
-        Args:
-            log_path: Path to JSONL file for logging
-        """
-        self.log_path = Path(log_path)
-        self.log_file = None
-        self._lock = threading.Lock()
+        self._log_path = Path(log_path) if log_path else None
+        self._log_file = None
+        self._sink = sink or self._file_sink
+        self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._drain_task: asyncio.Task | None = None
+
+    def _file_sink(self, entry: dict) -> None:
+        """Built-in sink that writes JSONL to the configured log file."""
+        if self._log_file:
+            self._log_file.write(json.dumps(entry) + '\n')
+            self._log_file.flush()
 
     def log_call(
         self,
@@ -87,10 +106,7 @@ class LLMCallLogger:
     ) -> None:
         """Log an LLM call with token usage.
 
-        This method is called directly from LLM clients after each API call,
-        providing accurate token counts from the response object.
-
-        Thread-safe: uses internal lock for concurrent write protection.
+        Non-blocking: enqueues the entry for background processing.
 
         Args:
             model: Name of the model used
@@ -107,10 +123,7 @@ class LLMCallLogger:
             'tokens_in': tokens_in,
             'tokens_out': tokens_out,
         }
-        if self.log_file:
-            with self._lock:
-                self.log_file.write(json.dumps(log_entry) + '\n')
-                self.log_file.flush()
+        self._queue.put_nowait(log_entry)
 
     def log_retry(
         self,
@@ -122,7 +135,7 @@ class LLMCallLogger:
     ) -> None:
         """Log a retry attempt before it happens.
 
-        Thread-safe: uses internal lock for concurrent write protection.
+        Non-blocking: enqueues the entry for background processing.
 
         Args:
             model: Name of the model that triggered retry
@@ -133,151 +146,77 @@ class LLMCallLogger:
         """
         log_entry = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'event': 'retry',  # Distinguishes from regular calls
+            'event': 'retry',
             'model': model,
             'error_type': error_type,
             'attempt': attempt,
             'max_retries': max_retries,
             'retry_delay_s': round(retry_delay, 2),
         }
-        if self.log_file:
-            with self._lock:
-                self.log_file.write(json.dumps(log_entry) + '\n')
-                self.log_file.flush()
+        self._queue.put_nowait(log_entry)
+
+    async def _drain_loop(self) -> None:
+        """Background task that drains the queue and dispatches to the sink."""
+        while True:
+            entry = await self._queue.get()
+            if entry is None:  # Sentinel — time to shut down
+                break
+            try:
+                self._sink(entry)
+            except Exception as e:
+                logger.warning(f'LLM call logger sink error: {e}')
+
+    async def _flush(self) -> None:
+        """Drain any remaining entries from the queue (non-blocking)."""
+        while not self._queue.empty():
+            try:
+                entry = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if entry is None:
+                continue
+            try:
+                self._sink(entry)
+            except Exception as e:
+                logger.warning(f'LLM call logger sink error during flush: {e}')
 
     @asynccontextmanager
     async def open(self):
-        """Open logger for direct logging without httpx hooks.
+        """Activate the logger: open resources and start the background drain task.
 
-        Use this context manager when logging from LLM client level
-        rather than via httpx event hooks.
+        Example — file-based logging::
 
-        Example:
-            >>> logger = LLMCallLogger("logs/llm_calls.jsonl")
-            >>> async with logger.open():
-            ...     logger.log_call(model="gpt-4", duration_ms=100, tokens_in=50, tokens_out=20)
+            logger = LLMCallLogger(log_path="logs/llm_calls.jsonl")
+            async with logger.open():
+                logger.log_call(model="gpt-4", duration_ms=100, tokens_in=50, tokens_out=20)
+
+        Example — custom sink::
+
+            logger = LLMCallLogger(sink=lambda entry: track_metric("llm_call", entry))
+            async with logger.open():
+                logger.log_call(model="gpt-4", duration_ms=100, tokens_in=50, tokens_out=20)
         """
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_file = open(self.log_path, 'a')
+        # Open log file if using file sink
+        if self._log_path:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = open(self._log_path, 'a')
+
+        # Start background drain task
+        self._drain_task = asyncio.create_task(self._drain_loop())
+
         try:
             yield self
         finally:
-            if self.log_file:
-                self.log_file.close()
-                self.log_file = None
+            # Send sentinel to stop drain loop
+            self._queue.put_nowait(None)
+            if self._drain_task:
+                await self._drain_task
+                self._drain_task = None
 
-    async def _log_request(self, request: httpx.Request) -> None:
-        """Hook called before request is sent.
+            # Flush any stragglers
+            await self._flush()
 
-        Stores start time in request extensions for duration calculation.
-        """
-        request.extensions['llm_log_start_time'] = time.time()
-
-    async def _log_response(self, response: httpx.Response) -> None:
-        """Hook called after response is received.
-
-        Logs request/response metadata to JSONL file.
-        """
-        start_time = response.request.extensions.get('llm_log_start_time')
-        if start_time is None:
-            # Request wasn't tracked (shouldn't happen)
-            return
-
-        duration_ms = (time.time() - start_time) * 1000
-
-        log_entry = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'method': response.request.method,
-            'url': str(response.request.url.path),  # Just path, not full URL with credentials
-            'status': response.status_code,
-            'duration_ms': round(duration_ms, 2),
-            'model': self._extract_model(response.request),
-        }
-
-        # Append to JSONL file
-        if self.log_file:
-            self.log_file.write(json.dumps(log_entry) + '\n')
-            self.log_file.flush()
-
-    def _extract_model(self, request: httpx.Request) -> str | None:
-        """Extract model name from request body.
-
-        Args:
-            request: httpx Request object
-
-        Returns:
-            Model name if found, None otherwise
-        """
-        try:
-            if request.content:
-                body = json.loads(request.content)
-                return body.get('model')
-        except Exception:
-            pass
-        return None
-
-    @asynccontextmanager
-    async def enable(self, client: httpx.AsyncClient):
-        """Enable logging for httpx client within context.
-
-        Args:
-            client: httpx.AsyncClient to instrument
-
-        Yields:
-            None
-
-        Example:
-            >>> logger = LLMCallLogger("logs/llm_calls.jsonl")
-            >>> async with logger.enable(httpx_client):
-            ...     # All HTTP calls within this context are logged
-            ...     await httpx_client.get("https://api.example.com")
-        """
-        # Create log directory if needed
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Open log file in append mode
-        self.log_file = open(self.log_path, 'a')
-
-        # Add event hooks to client
-        client.event_hooks['request'].append(self._log_request)
-        client.event_hooks['response'].append(self._log_response)
-
-        try:
-            yield
-        finally:
-            # Remove hooks
-            try:
-                client.event_hooks['request'].remove(self._log_request)
-                client.event_hooks['response'].remove(self._log_response)
-            except ValueError:
-                # Hooks already removed (shouldn't happen but handle gracefully)
-                pass
-
-            # Close file
-            if self.log_file:
-                self.log_file.close()
-                self.log_file = None
-
-
-async def get_httpx_client_from_openai(openai_client: Any) -> httpx.AsyncClient | None:
-    """Extract httpx.AsyncClient from OpenAI client.
-
-    OpenAI's AsyncOpenAI and AsyncAzureOpenAI clients wrap an httpx.AsyncClient
-    internally. This helper extracts it for instrumentation.
-
-    Args:
-        openai_client: AsyncOpenAI or AsyncAzureOpenAI instance
-
-    Returns:
-        httpx.AsyncClient if found, None otherwise
-    """
-    try:
-        # OpenAI client stores httpx client as ._client
-        if hasattr(openai_client, '_client'):
-            httpx_client = openai_client._client
-            if isinstance(httpx_client, httpx.AsyncClient):
-                return httpx_client
-    except Exception as e:
-        logger.warning(f'Failed to extract httpx client from OpenAI client: {e}')
-
-    return None
+            # Close file if applicable
+            if self._log_file:
+                self._log_file.close()
+                self._log_file = None
