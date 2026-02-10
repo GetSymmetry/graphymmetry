@@ -784,6 +784,20 @@ class Graphiti:
             resolved_edges.extend(result[0])
             invalidated_edges.extend(result[1])
 
+        # Populate empty node summaries from edge facts
+        # (Node hydration happens before edge extraction, so summaries are empty for new nodes)
+        from collections import defaultdict as _defaultdict
+
+        _edges_by_node: dict[str, list[str]] = _defaultdict(list)
+        for edge in resolved_edges:
+            if edge.fact:
+                _edges_by_node[edge.source_node_uuid].append(edge.fact)
+                _edges_by_node[edge.target_node_uuid].append(edge.fact)
+
+        for node in final_hydrated_nodes:
+            if not node.summary.strip() and node.uuid in _edges_by_node:
+                node.summary = '\n'.join(_edges_by_node[node.uuid])
+
         return final_hydrated_nodes, resolved_edges, invalidated_edges, uuid_map
 
     @handle_multiple_group_ids
