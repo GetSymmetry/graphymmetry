@@ -46,7 +46,7 @@ from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 
 DEFAULT_EDGE_NAME = 'RELATES_TO'
-MAX_NODES = 15
+MAX_NODES = 40
 
 logger = logging.getLogger(__name__)
 
